@@ -1,0 +1,7 @@
+name: 'Sync Roles Bridge'
+type: module
+description: 'Bridge to trigger sync roles logic in the CiviCRM extension.'
+core_version_requirement: ^8 || ^10
+dependencies:
+  - drupal:civicrm
+  - drupal:civicrm_entity

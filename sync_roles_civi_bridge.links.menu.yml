@@ -1,0 +1,6 @@
+sync_roles_civi_bridge.settings_form:
+  title: 'Sync Roles CiviCRM Bridge'
+  description: 'Configure settings and manually sync user roles to CiviCRM.'
+  parent: entity.user.collection
+  route_name: sync_roles_civi_bridge.settings_form
+  weight: 100

@@ -1,0 +1,7 @@
+sync_roles_civi_bridge.settings_form:
+  path: '/admin/config/people/sync-roles-bridge'
+  defaults:
+    _form: '\Drupal\sync_roles_civi_bridge\Form\SyncRolesBridgeSettingsForm'
+    _title: 'Sync Roles Bridge to CiviCRM Settings'
+  requirements:
+    _permission: 'administer site configuration'

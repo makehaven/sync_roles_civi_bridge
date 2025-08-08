@@ -1,0 +1,6 @@
+{
+    "name": "makehaven/sync_roles_civi_bridge",
+    "type": "drupal-custom-module",
+    "description": "Bridge to trigger sync roles logic in the CiviCRM extension.",
+    "license": "GPL-2.0-or-later"
+}
