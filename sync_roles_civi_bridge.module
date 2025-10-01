@@ -2,8 +2,7 @@
 
 use Drupal\Core\Entity\EntityInterface;
 use Drupal\user\UserInterface;
-use Drupal\Core\Config\ConfigFactoryInterface;
-use Drupal\civicrm\CivicrmInitialize;
+use Drupal\civicrm\Civicrm;
 use Psr\Log\LoggerInterface;
 
 /**
@@ -17,10 +16,19 @@ function sync_roles_civi_bridge_entity_update(EntityInterface $entity): void {
     $logger = \Drupal::logger('sync_roles_civi_bridge');
     $logger->info("Entity update hook fired for user ID: @uid", ['@uid' => $uid]);
 
-    // Ensure we have the original entity data to compare against.
-    if (isset($entity->original) && $entity->original instanceof UserInterface) {
-      $current_roles = $entity->getRoles();
+    // Ensure we have the original roles data to compare against.
+    $original_roles_cache = &drupal_static('sync_roles_civi_bridge_original_roles', []);
+    $old_roles = NULL;
+    if (isset($original_roles_cache[$uid])) {
+      $old_roles = $original_roles_cache[$uid];
+      unset($original_roles_cache[$uid]);
+    }
+    elseif (isset($entity->original) && $entity->original instanceof UserInterface) {
       $old_roles = $entity->original->getRoles();
+    }
+
+    if ($old_roles !== NULL) {
+      $current_roles = $entity->getRoles();
 
       // Sort arrays for consistent comparison.
       sort($current_roles);
@@ -43,8 +51,46 @@ function sync_roles_civi_bridge_entity_update(EntityInterface $entity): void {
       // This might happen on first save after creation or if the original entity isn't available.
       // Optionally, you could trigger a sync here too if needed for newly created users,
       // but role changes are the primary trigger based on requirements.
-      $logger->info("No original user object found or entity type mismatch for user ID: @uid.", ['@uid' => $uid]);
+      $logger->info("No original user object found for user ID: @uid. Running sync as precaution.", ['@uid' => $uid]);
+      sync_roles_bridge_sync_to_civicrm($entity);
     }
+  }
+}
+
+/**
+ * Implements hook_user_presave().
+ */
+function sync_roles_civi_bridge_user_presave(UserInterface $account): void {
+  $uid = $account->id();
+  if (!$uid) {
+    return;
+  }
+
+  $original_roles_cache = &drupal_static('sync_roles_civi_bridge_original_roles', []);
+
+  if (isset($account->original) && $account->original instanceof UserInterface) {
+    $roles = $account->original->getRoles();
+  }
+  else {
+    /** @var \Drupal\user\UserStorageInterface $storage */
+    $storage = \Drupal::entityTypeManager()->getStorage('user');
+    $existing = $storage->loadUnchanged($uid);
+    $roles = $existing instanceof UserInterface ? $existing->getRoles() : $account->getRoles();
+  }
+
+  sort($roles);
+  $original_roles_cache[$uid] = $roles;
+}
+
+/**
+ * Implements hook_entity_insert().
+ *
+ * Ensures newly created users have their roles synchronized once saved.
+ */
+function sync_roles_civi_bridge_entity_insert(EntityInterface $entity): void {
+  if ($entity->getEntityTypeId() === 'user' && $entity instanceof UserInterface) {
+    \Drupal::logger('sync_roles_civi_bridge')->info('Entity insert hook fired for user ID: @uid', ['@uid' => $entity->id()]);
+    sync_roles_bridge_sync_to_civicrm($entity);
   }
 }
 
@@ -57,19 +103,22 @@ function sync_roles_civi_bridge_entity_update(EntityInterface $entity): void {
  * The user account.
  * @param \Psr\Log\LoggerInterface $logger
  * The logger service.
- * @param \Drupal\civicrm\CivicrmInitialize $civicrm_initialize
+ * @param \Drupal\civicrm\Civicrm $civicrm
  * The CiviCRM initialization service.
  *
  * @return int|null
  * The CiviCRM contact ID if found, or NULL otherwise.
  */
-function sync_roles_bridge_get_contact_id(UserInterface $account, LoggerInterface $logger, CivicrmInitialize $civicrm_initialize): ?int {
+function sync_roles_bridge_get_contact_id(UserInterface $account, LoggerInterface $logger, Civicrm $civicrm): ?int {
   $uid = $account->id();
 
-  // Ensure CiviCRM is usable
-  if (!$civicrm_initialize->initialize()) {
-      $logger->error('Failed to initialize CiviCRM for GetContactID.');
-      return NULL;
+  // Ensure CiviCRM is usable.
+  try {
+    $civicrm->initialize();
+  }
+  catch (\Throwable $e) {
+    $logger->error('Failed to initialize CiviCRM for GetContactID: @message', ['@message' => $e->getMessage()]);
+    return NULL;
   }
 
   // --- Attempt 1: UFMatch Lookup (Most Reliable) ---
@@ -77,7 +126,14 @@ function sync_roles_bridge_get_contact_id(UserInterface $account, LoggerInterfac
     $uf_match_result = civicrm_api3('UFMatch', 'get', [
       'sequential' => 1,
       'uf_id' => $uid,
+      'check_permissions' => 0,
     ]);
+    if (!empty($uf_match_result['is_error'])) {
+      $logger->error('GetContactID: UFMatch lookup failed for user @uid: @message', [
+        '@uid' => $uid,
+        '@message' => $uf_match_result['error_message'] ?? 'Unknown error',
+      ]);
+    }
     if (!empty($uf_match_result['values'])) {
       $contact_id = $uf_match_result['values'][0]['contact_id'];
       $logger->info("GetContactID: Found Contact ID @contact_id via UFMatch for User @uid.", [
@@ -109,7 +165,14 @@ function sync_roles_bridge_get_contact_id(UserInterface $account, LoggerInterfac
       'email' => $email,
       'return' => ['id'],
       'options' => ['limit' => 1], // Only need one match
+      'check_permissions' => 0,
     ]);
+    if (!empty($contact_result['is_error'])) {
+      $logger->error('GetContactID: Email lookup failed for user @uid: @message', [
+        '@uid' => $uid,
+        '@message' => $contact_result['error_message'] ?? 'Unknown error',
+      ]);
+    }
     if (!empty($contact_result['values'])) {
       $contact_id = $contact_result['values'][0]['id'];
       $logger->notice("GetContactID: Found Contact ID @contact_id via Email fallback for User @uid (@email).", [
@@ -141,101 +204,243 @@ function sync_roles_bridge_get_contact_id(UserInterface $account, LoggerInterfac
 }
 
 /**
- * Maps Drupal role names to CiviCRM Option Value IDs for a specific custom field.
+ * Resolve metadata for a target CiviCRM custom field.
  *
- * IMPORTANT: Assumes the target CiviCRM custom field uses Option Values and
- * that the Drupal role machine names exactly match the CiviCRM Option Value *Labels*.
+ * Accepts a field identifier in several formats (column name such as
+ * "custom_64", the field machine name, or the numeric field ID) and returns
+ * the metadata needed for subsequent API calls.
  *
- * @param array $role_names
- * Array of Drupal role machine names.
- * @param string $custom_field_name
- * The machine name of the CiviCRM custom field (e.g., 'custom_64').
+ * @param string $field_identifier
+ *   The identifier configured for the custom field.
  * @param \Psr\Log\LoggerInterface $logger
- * The logger service.
- * @param \Drupal\civicrm\CivicrmInitialize $civicrm_initialize
- * The CiviCRM initialization service.
+ *   The logger service.
  *
  * @return array|null
- * An array of CiviCRM Option Value IDs corresponding to the roles,
- * or NULL if mapping fails.
+ *   The resolved metadata array containing at minimum the keys `id` and
+ *   `column_name`. Returns NULL if the field cannot be resolved.
  */
-function sync_roles_bridge_map_roles_to_option_values(array $role_names, string $custom_field_name, LoggerInterface $logger, CivicrmInitialize $civicrm_initialize): ?array {
-    // Ensure CiviCRM is usable
-    if (!$civicrm_initialize->initialize()) {
-        $logger->error('Failed to initialize CiviCRM for MapRolesToOptionValues.');
-        return NULL;
-    }
+function sync_roles_bridge_resolve_custom_field(string $field_identifier, LoggerInterface $logger): ?array {
+  $field_identifier = trim($field_identifier);
+  if ($field_identifier === '') {
+    $logger->error('MapRoles: Empty custom field identifier provided.');
+    return NULL;
+  }
 
-    if (empty($role_names)) {
-        return []; // Return empty array if no roles to map
-    }
+  static $cache = [];
+  if (array_key_exists($field_identifier, $cache)) {
+    return $cache[$field_identifier] ?: NULL;
+  }
+
+  $strategies = [];
+  if (ctype_digit($field_identifier)) {
+    $strategies[] = ['id', (int) $field_identifier];
+  }
+  if (preg_match('/^custom_(\d+)$/i', $field_identifier, $matches)) {
+    $strategies[] = ['id', (int) $matches[1]];
+    $strategies[] = ['column_name', $field_identifier];
+  }
+  // Machine name lookup is the most common alternative.
+  $strategies[] = ['name', $field_identifier];
+
+  $metadata = NULL;
+  $attempts = [];
+
+  foreach ($strategies as [$field, $value]) {
+    $attempts[] = sprintf('%s=%s', $field, is_scalar($value) ? (string) $value : '[complex]');
 
     try {
-        // 1. Get Custom Field details to find the option group ID
-        $field_info = civicrm_api3('CustomField', 'get', [
-            'sequential' => 1,
-            'name' => $custom_field_name,
-            'return' => ['option_group_id'],
+      $result = civicrm_api3('CustomField', 'get', [
+        'sequential' => 1,
+        'return' => ['id', 'name', 'label', 'column_name', 'option_group_id', 'html_type', 'data_type', 'is_multi_select'],
+        'options' => ['limit' => 1],
+        'check_permissions' => 0,
+        $field => $value,
+      ]);
+      if (!empty($result['is_error'])) {
+        $logger->error('MapRoles: CustomField lookup error for @identifier via @field: @message', [
+          '@identifier' => $field_identifier,
+          '@field' => $field,
+          '@message' => $result['error_message'] ?? 'Unknown error',
         ]);
+        continue;
+      }
+    }
+    catch (\Exception $e) {
+      $logger->error('MapRoles: Failed to look up custom field @identifier via @field: @message', [
+        '@identifier' => $field_identifier,
+        '@field' => $field,
+        '@message' => $e->getMessage(),
+      ]);
+      continue;
+    }
 
-        if (empty($field_info['values'][0]['option_group_id'])) {
-            $logger->error("MapRoles: Could not find option_group_id for custom field '@custom_field'. Is it a Select/Checkbox field?", [
-                '@custom_field' => $custom_field_name,
-            ]);
-            return NULL;
-        }
-        $option_group_id = $field_info['values'][0]['option_group_id'];
+    if (!empty($result['values'][0])) {
+      $metadata = $result['values'][0];
+      break;
+    }
+  }
 
-        // 2. Get Option Values for that group ID
-        $option_values_result = civicrm_api3('OptionValue', 'get', [
-            'sequential' => 1,
-            'option_group_id' => $option_group_id,
-            'return' => ['label', 'value'], // 'value' holds the ID
-            'options' => ['limit' => 0], // Get all options
-        ]);
+  if (!$metadata) {
+    $logger->error('MapRoles: Unable to resolve CiviCRM custom field "@identifier". Attempted lookups: @attempts.', [
+      '@identifier' => $field_identifier,
+      '@attempts' => implode(', ', $attempts),
+    ]);
+    $cache[$field_identifier] = FALSE;
+    return NULL;
+  }
 
-        if (empty($option_values_result['values'])) {
-             $logger->warning("MapRoles: No option values found for option group ID @group_id (linked to custom field '@custom_field').", [
-                 '@group_id' => $option_group_id,
-                 '@custom_field' => $custom_field_name,
-             ]);
-             return NULL; // Or return [] if appropriate? Depends on expected behavior.
-        }
+  // Cache positive result for subsequent invocations.
+  // Ensure downstream consumers know the canonical API field name (custom_N).
+  if (!isset($metadata['api_field_name'])) {
+    $metadata['api_field_name'] = 'custom_' . ($metadata['id'] ?? '');
+  }
 
-        // 3. Create a map from Label => ID (Value)
-        $label_to_id_map = [];
-        foreach ($option_values_result['values'] as $option) {
-            // Assume label exactly matches role machine name
-            $label_to_id_map[$option['label']] = $option['value'];
-        }
+  $cache[$field_identifier] = $metadata;
+  return $metadata;
+}
 
-        // 4. Map input role names to IDs
-        $mapped_ids = [];
-        $unmapped_roles = [];
-        foreach ($role_names as $role_name) {
-            if (isset($label_to_id_map[$role_name])) {
-                $mapped_ids[] = $label_to_id_map[$role_name];
-            } else {
-                $unmapped_roles[] = $role_name;
-            }
-        }
+/**
+ * Builds a list of normalized keys for fuzzy-matching names/labels.
+ *
+ * @param string $value
+ *   The value to normalize.
+ *
+ * @return array
+ *   A list of normalized variants suitable for comparisons.
+ */
+function sync_roles_bridge_generate_match_variants(string $value): array {
+  $value = trim($value);
+  if ($value === '') {
+    return [];
+  }
 
-        if (!empty($unmapped_roles)) {
-            $logger->warning("MapRoles: Could not map the following Drupal roles to CiviCRM Option Values for field '@custom_field': [@unmapped_roles]. Check if Option Value Labels exactly match role names.", [
-                '@custom_field' => $custom_field_name,
-                '@unmapped_roles' => implode(', ', $unmapped_roles),
-            ]);
-        }
+  $lower = strtolower($value);
+  $variants = [
+    $lower,
+    str_replace([' ', '-'], '_', $lower),
+    str_replace(['_', '-'], ' ', $lower),
+    str_replace('_', '-', $lower),
+    str_replace([' ', '_', '-'], '', $lower),
+  ];
 
-        return $mapped_ids;
+  $unique = [];
+  foreach ($variants as $variant) {
+    $variant = trim($variant);
+    if ($variant === '') {
+      continue;
+    }
+    $unique[$variant] = TRUE;
+  }
 
-    } catch (\Exception $e) {
-        $logger->error("MapRoles: CiviCRM API error mapping roles for field '@custom_field': @message", [
-            '@custom_field' => $custom_field_name,
-            '@message' => $e->getMessage(),
+  return array_keys($unique);
+}
+
+/**
+ * Maps Drupal role names to values belonging to a CiviCRM Option Group.
+ *
+ * @param array $role_names
+ *   Array of Drupal role machine names.
+ * @param int $option_group_id
+ *   The option group identifier attached to the custom field.
+ * @param \Psr\Log\LoggerInterface $logger
+ *   The logger service.
+ *
+ * @return array|null
+ *   An array of CiviCRM option values corresponding to the roles, NULL on
+ *   failure.
+ */
+function sync_roles_bridge_map_roles_to_option_values(array $role_names, int $option_group_id, LoggerInterface $logger): ?array {
+  if (empty($role_names)) {
+    return [];
+  }
+
+  if ($option_group_id <= 0) {
+    $logger->error('MapRoles: Invalid option group ID (@id) provided.', ['@id' => $option_group_id]);
+    return NULL;
+  }
+
+  static $option_group_cache = [];
+
+  if (!isset($option_group_cache[$option_group_id])) {
+    try {
+      $option_values_result = civicrm_api3('OptionValue', 'get', [
+        'sequential' => 1,
+        'option_group_id' => $option_group_id,
+        'is_active' => 1,
+        'return' => ['label', 'name', 'value'],
+        'options' => ['limit' => 0],
+        'check_permissions' => 0,
+      ]);
+      if (!empty($option_values_result['is_error'])) {
+        $logger->error('MapRoles: OptionValue lookup error for option group @group_id: @message', [
+          '@group_id' => $option_group_id,
+          '@message' => $option_values_result['error_message'] ?? 'Unknown error',
         ]);
         return NULL;
+      }
     }
+    catch (\Exception $e) {
+      $logger->error('MapRoles: Failed to load option values for option group @group_id: @message', [
+        '@group_id' => $option_group_id,
+        '@message' => $e->getMessage(),
+      ]);
+      return NULL;
+    }
+
+    if (empty($option_values_result['values'])) {
+      $logger->warning('MapRoles: No option values found for option group @group_id.', ['@group_id' => $option_group_id]);
+      $option_group_cache[$option_group_id] = ['map' => []];
+    }
+    else {
+      $key_map = [];
+      foreach ($option_values_result['values'] as $option) {
+        $value = (string) $option['value'];
+        $candidates = [];
+        foreach (['label', 'name', 'value'] as $property) {
+          if (!empty($option[$property])) {
+            $candidates[] = strtolower((string) $option[$property]);
+          }
+        }
+        foreach ($candidates as $candidate) {
+          foreach (sync_roles_bridge_generate_match_variants($candidate) as $variant) {
+            $key_map[$variant] = $value;
+          }
+        }
+      }
+      $option_group_cache[$option_group_id] = ['map' => $key_map];
+    }
+  }
+
+  $key_map = $option_group_cache[$option_group_id]['map'];
+
+  if (!$key_map) {
+    return [];
+  }
+
+  $mapped = [];
+  $unmapped = [];
+  foreach ($role_names as $role_name) {
+    $matched = FALSE;
+    foreach (sync_roles_bridge_generate_match_variants($role_name) as $variant) {
+      if (isset($key_map[$variant])) {
+        $mapped[$key_map[$variant]] = TRUE;
+        $matched = TRUE;
+        break;
+      }
+    }
+    if (!$matched) {
+      $unmapped[] = $role_name;
+    }
+  }
+
+  if (!empty($unmapped)) {
+    $logger->warning('MapRoles: Unmapped Drupal roles for option group @group_id: [@roles].', [
+      '@group_id' => $option_group_id,
+      '@roles' => implode(', ', $unmapped),
+    ]);
+  }
+
+  return array_keys($mapped);
 }
 
 /**
@@ -252,26 +457,46 @@ function sync_roles_bridge_sync_to_civicrm(UserInterface $account): void {
   $logger = \Drupal::logger('sync_roles_civi_bridge');
   /** @var \Drupal\Core\Config\ConfigFactoryInterface $config_factory */
   $config_factory = \Drupal::service('config.factory');
-  /** @var \Drupal\civicrm\CivicrmInitialize $civicrm_initialize */
-  $civicrm_initialize = \Drupal::service('civicrm');
+  /** @var \Drupal\civicrm\Civicrm $civicrm */
+  $civicrm = \Drupal::service('civicrm');
 
   // --- Initialization and Configuration ---
-  if (!$civicrm_initialize->initialize()) {
-    $logger->error('SyncToCivi: Failed to initialize CiviCRM.');
+  try {
+    $civicrm->initialize();
+  }
+  catch (\Throwable $e) {
+    $logger->error('SyncToCivi: Failed to initialize CiviCRM: @message', ['@message' => $e->getMessage()]);
     return;
   }
 
   $config = $config_factory->get('sync_roles_civi_bridge.settings');
-  $custom_field_name = $config->get('custom_field');
+  $custom_field_identifier = $config->get('custom_field');
 
-  if (empty($custom_field_name)) {
-      $custom_field_name = 'custom_64'; // Default value
-      $logger->warning("SyncToCivi: CiviCRM custom field name not found in config (sync_roles_civi_bridge.settings:custom_field). Using default '@default'.", [
-          '@default' => $custom_field_name,
-      ]);
-  } else {
-      $logger->info("SyncToCivi: Using configured CiviCRM custom field '@custom_field'.", ['@custom_field' => $custom_field_name]);
+  if (empty($custom_field_identifier)) {
+    $custom_field_identifier = 'custom_64';
+    $logger->warning('SyncToCivi: Custom field setting is empty; falling back to default @default.', ['@default' => $custom_field_identifier]);
   }
+  else {
+    $logger->info('SyncToCivi: Using configured CiviCRM custom field identifier "@identifier".', ['@identifier' => $custom_field_identifier]);
+  }
+
+  $field_metadata = sync_roles_bridge_resolve_custom_field($custom_field_identifier, $logger);
+  if (!$field_metadata) {
+    $logger->error('SyncToCivi: Failed to resolve metadata for custom field "@identifier". Aborting sync.', ['@identifier' => $custom_field_identifier]);
+    return;
+  }
+
+  $column_name = $field_metadata['column_name'] ?? $custom_field_identifier;
+  $api_field_name = $field_metadata['api_field_name'] ?? $custom_field_identifier;
+  $option_group_id = !empty($field_metadata['option_group_id']) ? (int) $field_metadata['option_group_id'] : NULL;
+  $html_type = $field_metadata['html_type'] ?? NULL;
+  $is_multi_select = !empty($field_metadata['is_multi_select']) || in_array($html_type, ['CheckBox', 'Multi-Select', 'AdvMulti-Select'], TRUE);
+
+  $logger->info('SyncToCivi: Resolved custom field identifier "@identifier" to column "@column" (Option Group: @group).', [
+    '@identifier' => $custom_field_identifier,
+    '@column' => $api_field_name,
+    '@group' => $option_group_id ?? 'n/a',
+  ]);
 
   // --- Get Data ---
   $uid = $account->id();
@@ -285,7 +510,7 @@ function sync_roles_bridge_sync_to_civicrm(UserInterface $account): void {
       '@filtered_roles' => implode(', ', $filtered_roles),
   ]);
 
-  $contactId = sync_roles_bridge_get_contact_id($account, $logger, $civicrm_initialize);
+  $contactId = sync_roles_bridge_get_contact_id($account, $logger, $civicrm);
   if (!$contactId) {
     $logger->error("SyncToCivi: Could not find Contact ID for User @uid. Aborting sync.", ['@uid' => $uid]);
     return;
@@ -296,39 +521,43 @@ function sync_roles_bridge_sync_to_civicrm(UserInterface $account): void {
   ]);
 
 
-  // --- CRITICAL STEP: Map Role Names to CiviCRM Option Value IDs ---
-  // IMPORTANT: This assumes the target field is Select/Checkbox and role names match option labels.
-  $civi_role_values = sync_roles_bridge_map_roles_to_option_values($filtered_roles, $custom_field_name, $logger, $civicrm_initialize);
+  // --- CRITICAL STEP: Prepare the value that will be written to CiviCRM ---
+  if ($option_group_id) {
+    $civi_role_values = sync_roles_bridge_map_roles_to_option_values($filtered_roles, $option_group_id, $logger);
 
-  // Handle mapping failure or unmapped roles if necessary
-  if ($civi_role_values === NULL) {
-      $logger->error("SyncToCivi: Failed to map Drupal roles to CiviCRM Option Values for User @uid. Aborting API call.", ['@uid' => $uid]);
+    if ($civi_role_values === NULL) {
+      $logger->error('SyncToCivi: Failed to map Drupal roles to CiviCRM Option Values for User @uid. Aborting API call.', ['@uid' => $uid]);
       return;
+    }
+
+    if ($is_multi_select) {
+      $civi_field_value_for_api = [];
+      foreach ($civi_role_values as $value) {
+        $civi_field_value_for_api[(string) $value] = (string) $value;
+      }
+    }
+    else {
+      $civi_field_value_for_api = !empty($civi_role_values) ? (string) reset($civi_role_values) : '';
+    }
   }
-  // If $civi_role_values is an empty array [], the API call will clear the field, which is often desired.
-
-
-  // --- ADAPT HERE IF CUSTOM FIELD IS NOT SELECT/CHECKBOX ---
-  // Example if it's a Text field expecting comma-separated values:
-  // $civi_role_values_for_api = implode(',', $filtered_roles);
-  // Remove the sync_roles_bridge_map_roles_to_option_values call above if using this.
-
-  // For now, we proceed assuming it's Select/Checkbox needing IDs:
-  $civi_role_values_for_api = $civi_role_values;
-  // --- End Adaptation Section ---
+  else {
+    // Fall back to storing the raw role names as a comma separated string.
+    $logger->notice('SyncToCivi: Custom field @column is not option-based; storing raw Drupal roles.', ['@column' => $api_field_name]);
+    $civi_field_value_for_api = !empty($filtered_roles) ? implode(',', $filtered_roles) : '';
+  }
 
 
   // --- Prepare and Execute API Call ---
   $params = [
     'id' => $contactId, // Use 'id' instead of 'contact_id' for Contact.create with existing ID
-    $custom_field_name => $civi_role_values_for_api,
-    'check_permissions' => FALSE, // Matches behavior seen in original logs
+    $api_field_name => $civi_field_value_for_api,
+    'check_permissions' => 0,
   ];
 
   $log_params = $params; // Copy params for logging
   // Avoid logging potentially sensitive data if custom field could hold it
-  // unset($log_params[$custom_field_name]);
-  // $log_params[$custom_field_name] = is_array($civi_role_values_for_api) ? implode(',', $civi_role_values_for_api) : $civi_role_values_for_api; // Log formatted value
+  // unset($log_params[$api_field_name]);
+  // $log_params[$api_field_name] = is_array($civi_field_value_for_api) ? implode(',', $civi_field_value_for_api) : $civi_field_value_for_api; // Log formatted value
   $logger->notice("SyncToCivi: PARAMS Sent to API for User @uid (Contact @contact_id): @params", [
       '@uid' => $uid,
       '@contact_id' => $contactId,

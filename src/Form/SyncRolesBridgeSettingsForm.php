@@ -34,7 +34,7 @@ class SyncRolesBridgeSettingsForm extends ConfigFormBase {
       '#type' => 'textfield',
       '#title' => $this->t('CiviCRM Custom Field'),
       '#default_value' => $config->get('custom_field') ?: 'custom_64',
-      '#description' => $this->t('Enter the CiviCRM custom field ID (multi-select) where roles will be stored.'),
+      '#description' => $this->t('Provide the CiviCRM custom field column name (e.g. custom_64) or numeric field ID where roles should be stored.'),
     ];
 
     $form['sync_all'] = [

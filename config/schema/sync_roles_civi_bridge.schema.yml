@@ -1,0 +1,7 @@
+sync_roles_civi_bridge.settings:
+  type: config_object
+  label: 'Sync Roles Civi Bridge settings'
+  mapping:
+    custom_field:
+      type: string
+      label: 'CiviCRM custom field identifier'
