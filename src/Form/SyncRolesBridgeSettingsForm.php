@@ -73,7 +73,6 @@ class SyncRolesBridgeSettingsForm extends ConfigFormBase {
       'file' => $module_path . '/sync_roles_civi_bridge.module',
     ];
     batch_set($batch);
-    $form_state->setRedirect('sync_roles_civi_bridge.settings_form');
   }
 
   /**
